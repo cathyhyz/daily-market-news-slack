@@ -1,27 +1,34 @@
 # Automated daily market news to Slack
 
-Python workflow: fetch recent business headlines (NewsAPI), ask **Google Gemini** for the top 5 US market-moving stories using the prompt from the design doc, post to Slack via Incoming Webhook. Intended to run on **GitHub Actions** on weekdays.
+Python workflow: fetch headlines from **RSS/Atom feeds** (no NewsAPI key), ask **Google Gemini** for the top 5 US market-moving stories using the prompt from the design doc, post to Slack via Incoming Webhook. Intended to run on **GitHub Actions** on weekdays.
 
 ## Prerequisites
 
-- [NewsAPI.org](https://newsapi.org/) API key (developer tier is enough for daily runs).
+- **RSS feeds** — defaults are built in (BBC Business + Dow Jones / MarketWatch pulse). Override with env **`RSS_FEEDS`** (comma-separated URLs) if you want other sources. Respect each publisher’s **terms of use** and crawling etiquette.
 - [Google AI Studio](https://aistudio.google.com/apikey) (or Google Cloud) **Gemini API key**.
 - [Slack Incoming Webhook](https://api.slack.com/messaging/webhooks) URL for your channel.
 
 ## Security
 
 - **Never commit API keys** or paste them into chat, tickets, or screenshots. This repo’s `.gitignore` ignores `.env` to reduce accidents.
-- If a key was exposed, **rotate it** in the provider’s dashboard (NewsAPI: account → regenerate) and update GitHub **Secrets** / your local `.env` only on your machine.
+- If a key was exposed, **rotate it** in the provider’s dashboard and update GitHub **Secrets** / your local `.env` only on your machine.
 
 ## GitHub repository secrets
 
 | Secret | Description |
 |--------|-------------|
-| `NEWS_API_KEY` | NewsAPI key |
 | `GEMINI_API_KEY` | Google Gemini API key |
-| `SLACK_WEBHOOK_URL` | Full Slack webhook URL |
+| `SLACK_WEBHOOK_URL` | Full Slack Incoming Webhook URL |
 
-Optional **repository variables** (or set as env in workflow): `NEWS_QUERY`, `NEWS_PAGE_SIZE`, `GEMINI_MODEL`, `LLM_TEMPERATURE`, `MIN_ARTICLES`.
+Optional **repository variables** (Settings → Secrets and variables → **Actions** → **Variables**):
+
+| Variable | Description |
+|----------|-------------|
+| `RSS_FEEDS` | Comma-separated RSS/Atom URLs (overrides built-in defaults) |
+| `NEWS_MAX_ITEMS` | Max items to send to the model after merge/dedupe (default `40`) |
+| `GEMINI_MODEL`, `LLM_TEMPERATURE`, `MIN_ARTICLES` | Same as before |
+
+You can set **`RSS_USER_AGENT`** in the environment if a feed requires a specific client string.
 
 ## Local run
 
@@ -36,7 +43,7 @@ cd /path/to/this/repo
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# Ensure NEWS_API_KEY, GEMINI_API_KEY, SLACK_WEBHOOK_URL are set (see above)
+# Ensure GEMINI_API_KEY and SLACK_WEBHOOK_URL are set; RSS_FEEDS optional
 PYTHONPATH=src python -m market_news
 ```
 

@@ -1,27 +1,117 @@
-"""Fetch headlines via NewsAPI.org (everything endpoint, last 24h)."""
+"""Fetch headlines from RSS/Atom feeds (no NewsAPI key)."""
 
 from __future__ import annotations
 
+import html
 import logging
 import os
+import re
 import time
-from datetime import datetime, timedelta, timezone
+from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
+from market_news.rss_parse import parse_feed_xml
+
 logger = logging.getLogger(__name__)
 
-NEWSAPI_EVERYTHING = "https://newsapi.org/v2/everything"
-DEFAULT_QUERY = "(stock market OR S&P 500 OR Federal Reserve OR earnings OR inflation OR treasury)"
-DEFAULT_PAGE_SIZE = 30
 HTTP_TIMEOUT = 30.0
 MAX_429_RETRIES = 2
 BACKOFF_SEC = 2.0
 
+# Default feeds: English-language business / markets (override with RSS_FEEDS).
+DEFAULT_RSS_FEEDS: tuple[str, ...] = (
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    # MarketWatch / Dow Jones public feed (301s from legacy marketwatch.com path).
+    "https://feeds.content.dowjones.io/public/rss/mw_marketpulse",
+)
 
-def _from_iso_utc() -> str:
-    since = datetime.now(timezone.utc) - timedelta(hours=24)
-    return since.strftime("%Y-%m-%dT%H:%M:%SZ")
+DEFAULT_USER_AGENT = (
+    "market-news-digest/1.0 (+https://github.com/readme; automated weekday run)"
+)
+
+
+def _strip_html(text: str) -> str:
+    if not text:
+        return ""
+    t = re.sub(r"<[^>]+>", " ", text)
+    t = html.unescape(t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _feed_urls() -> list[str]:
+    raw = (os.environ.get("RSS_FEEDS") or "").strip()
+    if raw:
+        return [u.strip() for u in raw.split(",") if u.strip()]
+    return list(DEFAULT_RSS_FEEDS)
+
+
+def _normalize_link(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        p = urlparse(url.strip())
+        return f"{p.scheme}://{p.netloc.lower()}{p.path or ''}".rstrip("/")
+    except Exception:
+        return url.strip().lower()
+
+
+def _entry_to_article(entry: Any) -> dict | None:
+    title = (getattr(entry, "title", None) or "").strip()
+    if not title or title == "[Removed]":
+        return None
+    link = (getattr(entry, "link", None) or "").strip()
+    summary = getattr(entry, "summary", None) or getattr(entry, "description", None) or ""
+    summary = _strip_html(str(summary))[:2000]
+    return {
+        "title": title,
+        "description": summary,
+        "content": "",
+        "url": link,
+    }
+
+
+def _published_ts(entry: Any) -> float:
+    t = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    if t:
+        try:
+            return float(time.mktime(t))
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _dedupe_entries(entries: list[Any]) -> list[tuple[float, dict]]:
+    """Return (timestamp, article) list, one row per dedupe key, newest wins."""
+    by_key: dict[str, tuple[float, dict]] = {}
+    for entry in entries:
+        art = _entry_to_article(entry)
+        if not art:
+            continue
+        key = _normalize_link(art["url"]) or art["title"].lower()
+        ts = _published_ts(entry)
+        prev = by_key.get(key)
+        if prev is None or ts >= prev[0]:
+            by_key[key] = (ts, art)
+    return list(by_key.values())
+
+
+def _fetch_feed_xml(client: httpx.Client, url: str, user_agent: str) -> str:
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+    }
+    for attempt in range(MAX_429_RETRIES + 1):
+        r = client.get(url, headers=headers)
+        if r.status_code == 429 and attempt < MAX_429_RETRIES:
+            wait = BACKOFF_SEC * (attempt + 1)
+            logger.warning("RSS 429 for %s, retry in %ss", url, wait)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.text
+    raise RuntimeError(f"RSS exhausted retries: {url}")
 
 
 def fetch_news_articles(
@@ -30,56 +120,35 @@ def fetch_news_articles(
     page_size: int | None = None,
 ) -> list[dict]:
     """
-    Return list of article dicts (title, description, content, url) from NewsAPI.
-    Retries on HTTP 429 with backoff.
+    Aggregate items from RSS_FEEDS (comma-separated URLs) or built-in defaults.
+
+    ``api_key`` / ``query`` are ignored (kept for call-site compatibility).
+    ``page_size`` caps total items after merge (default from NEWS_MAX_ITEMS or 40).
     """
-    key = api_key or os.environ.get("NEWS_API_KEY")
-    if not key:
-        raise ValueError("NEWS_API_KEY is not set")
+    _ = api_key, query
+    max_items = page_size or int((os.environ.get("NEWS_MAX_ITEMS") or "40").strip() or "40")
+    max_items = max(5, min(max_items, 100))
+    user_agent = (os.environ.get("RSS_USER_AGENT") or "").strip() or DEFAULT_USER_AGENT
+    urls = _feed_urls()
+    if not urls:
+        raise ValueError("No RSS feed URLs configured (RSS_FEEDS empty and no defaults)")
 
-    q = query or os.environ.get("NEWS_QUERY", DEFAULT_QUERY)
-    size = page_size or int(os.environ.get("NEWS_PAGE_SIZE", str(DEFAULT_PAGE_SIZE)))
-    size = max(1, min(size, 100))
+    all_entries: list[Any] = []
+    with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+        for url in urls:
+            try:
+                body = _fetch_feed_xml(client, url, user_agent)
+                entries = parse_feed_xml(body)
+                logger.info("RSS %s: parsed_entries=%s", url, len(entries))
+                all_entries.extend(entries)
+            except Exception as e:
+                logger.warning("RSS feed failed %s: %s", url, e)
 
-    params = {
-        "q": q,
-        "language": "en",
-        "sortBy": "publishedAt",
-        "from": _from_iso_utc(),
-        "pageSize": size,
-        "page": 1,
-    }
-    headers = {"X-Api-Key": key}
+    if not all_entries:
+        raise RuntimeError("No articles from any RSS feed (all fetches failed or empty)")
 
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        for attempt in range(MAX_429_RETRIES + 1):
-            r = client.get(NEWSAPI_EVERYTHING, params=params, headers=headers)
-            if r.status_code == 429:
-                if attempt < MAX_429_RETRIES:
-                    wait = BACKOFF_SEC * (attempt + 1)
-                    logger.warning("NewsAPI 429, retrying in %s s", wait)
-                    time.sleep(wait)
-                    continue
-            r.raise_for_status()
-            data = r.json()
-            if data.get("status") != "ok":
-                raise RuntimeError(data.get("message") or "NewsAPI returned non-ok status")
-            articles = data.get("articles") or []
-            out: list[dict] = []
-            for a in articles:
-                if not isinstance(a, dict):
-                    continue
-                title = a.get("title")
-                if not title or title == "[Removed]":
-                    continue
-                out.append(
-                    {
-                        "title": title,
-                        "description": a.get("description") or "",
-                        "content": (a.get("content") or "")[:500],
-                        "url": a.get("url") or "",
-                    }
-                )
-            return out
-
-    raise RuntimeError("NewsAPI request exhausted retries without success")
+    scored = _dedupe_entries(all_entries)
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = [a for _, a in scored[:max_items]]
+    logger.info("RSS merged usable=%s (cap=%s)", len(out), max_items)
+    return out
