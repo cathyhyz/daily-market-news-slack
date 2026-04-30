@@ -1,4 +1,4 @@
-# Weekday digest: NewsAPI -> Gemini -> Slack webhook.
+# Weekday digest: RSS -> Gemini -> Slack webhook.
 # Cron is UTC; see README for US Eastern/Pacific equivalents.
 name: Daily market news
 
@@ -27,7 +27,9 @@ jobs:
 
       - name: Run market news pipeline
         env:
-          NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Optional: comma-separated RSS URLs (defaults in code if unset).
+          RSS_FEEDS: ${{ vars.RSS_FEEDS }}
+          NEWS_MAX_ITEMS: ${{ vars.NEWS_MAX_ITEMS }}
         run: PYTHONPATH=src python -m market_news
